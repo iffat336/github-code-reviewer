@@ -1,0 +1,12 @@
+google-generativeai
+PyGithub
+langchain
+langgraph
+langchain-google-genai
+langchain-community
+chromadb
+fastapi
+uvicorn
+python-dotenv
+requests
+tiktoken
