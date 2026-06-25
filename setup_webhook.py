@@ -1,40 +1,37 @@
-"""
-Registers a webhook on the GitHub repo so it notifies this agent
-every time a new Pull Request is opened.
+"""Register a signed GitHub pull-request webhook."""
 
-Usage: python setup_webhook.py <ngrok_or_public_url>
-Example: python setup_webhook.py https://your-tunnel.ngrok-free.dev
-"""
 import sys
-import os
-from github import Github, Auth
-from dotenv import load_dotenv
 
-load_dotenv()
+from github import Auth, Github
 
-if len(sys.argv) < 2:
-    print("Usage: python setup_webhook.py <public_url>")
-    print("Example: python setup_webhook.py https://your-tunnel.ngrok-free.dev")
-    sys.exit(1)
+from config import require_env
 
-PUBLIC_URL = sys.argv[1].rstrip("/")
 
-token = os.getenv("GITHUB_TOKEN")
-repo_name = os.getenv("GITHUB_REPO")
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: python setup_webhook.py <public_url>")
+        print("Example: python setup_webhook.py https://your-tunnel.example")
+        return 1
 
-g = Github(auth=Auth.Token(token))
-repo = g.get_repo(repo_name)
+    public_url = sys.argv[1].rstrip("/")
+    github = Github(auth=Auth.Token(require_env("GITHUB_TOKEN")))
+    repo = github.get_repo(require_env("GITHUB_REPO"))
+    hook = repo.create_hook(
+        name="web",
+        config={
+            "url": f"{public_url}/webhook",
+            "content_type": "json",
+            "secret": require_env("GITHUB_WEBHOOK_SECRET"),
+            "insecure_ssl": "0",
+        },
+        events=["pull_request"],
+        active=True,
+    )
 
-hook = repo.create_hook(
-    name="web",
-    config={
-        "url": f"{PUBLIC_URL}/webhook",
-        "content_type": "json"
-    },
-    events=["pull_request"],
-    active=True
-)
+    print(f"Webhook created! ID: {hook.id}")
+    print(f"Listening at: {public_url}/webhook")
+    return 0
 
-print(f"Webhook created! ID: {hook.id}")
-print(f"Listening at: {PUBLIC_URL}/webhook")
-print("GitHub will now call this URL every time a PR is opened.")
+
+if __name__ == "__main__":
+    raise SystemExit(main())

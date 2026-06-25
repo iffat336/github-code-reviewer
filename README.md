@@ -18,6 +18,7 @@ reviews from the command line.
 - [GitHub permissions](#github-permissions)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Automated tests and CI](#automated-tests-and-ci)
 - [Indexing the repository](#indexing-the-repository)
 - [Manual review](#manual-review)
 - [Autonomous webhook review](#autonomous-webhook-review)
@@ -29,8 +30,10 @@ reviews from the command line.
 
 ## Features
 
-- **Automatic pull-request reviews:** listens for newly opened PRs through a
-  GitHub webhook.
+- **Signed webhook validation:** verifies GitHub's `X-Hub-Signature-256`
+  before accepting any payload.
+- **Automatic repeat reviews:** responds to opened, reopened, synchronized, and
+  ready-for-review pull-request events.
 - **Structured feedback:** reports bugs, security concerns, performance
   issues, code-quality observations, and concrete suggestions.
 - **Repository-aware context:** ChromaDB retrieves code related to the PR title
@@ -39,6 +42,12 @@ reviews from the command line.
   generated review as a PR conversation comment.
 - **Background processing:** FastAPI acknowledges the webhook quickly and runs
   the review as a background task.
+- **Single updatable review:** later commits update the agent's existing PR
+  comment instead of creating an unlimited stream of duplicate comments.
+- **Prompt-injection boundaries:** PR text is labeled as untrusted and both
+  diff and repository context are size-limited.
+- **Automated quality checks:** pytest coverage and GitHub Actions CI validate
+  signatures, event handling, configuration, and GitHub comment behavior.
 - **Manual approval mode:** preview a generated review before deciding whether
   to publish it.
 - **Direct automation mode:** review and post a selected PR without prompting.
@@ -87,20 +96,24 @@ GitHub pull request opened
 ## Review workflow
 
 1. GitHub sends a `pull_request` webhook event to `/webhook`.
-2. The server checks that the action is `opened`.
-3. A FastAPI background task starts processing the PR.
+2. The server verifies the webhook's HMAC-SHA256 signature.
+3. Supported non-draft PR actions are queued as a FastAPI background task.
 4. `github_client.py` retrieves the PR title, description, changed filenames,
    statuses, and available patches.
 5. `rag_indexer.py` searches the local ChromaDB collection using the PR title
    and description.
 6. `reviewer_agent.py` sends the PR data and retrieved context to
    `llama-3.3-70b-versatile` through Groq.
-7. The generated Markdown review is posted as a pull-request comment.
+7. The generated Markdown review creates or updates the agent's marked
+   pull-request comment.
 
 ## Project structure
 
 ```text
 github-code-reviewer/
+|-- .github/workflows/ci.yml
+|-- tests/
+|-- config.py
 |-- github_client.py
 |-- reviewer_agent.py
 |-- rag_indexer.py
@@ -110,6 +123,7 @@ github-code-reviewer/
 |-- auto_review.py
 |-- create_test_pr.py
 |-- create_test_pr2.py
+|-- pytest.ini
 |-- requirements.txt
 |-- .env.example
 |-- .gitignore
@@ -118,11 +132,14 @@ github-code-reviewer/
 
 | File | Purpose |
 |---|---|
+| `config.py` | Loads required settings and validates numeric limits. |
 | `github_client.py` | Creates the GitHub client, reads PR details, and posts review comments. |
 | `reviewer_agent.py` | Builds the review prompt and calls the Groq chat-completions API. |
 | `rag_indexer.py` | Downloads supported source files from the configured repository, stores them in ChromaDB, and performs semantic context searches. |
-| `webhook_server.py` | Exposes the FastAPI webhook endpoint and runs review processing in the background. |
-| `setup_webhook.py` | Registers a pull-request webhook for a public server or tunnel URL. |
+| `webhook_server.py` | Verifies webhook signatures, filters PR actions, and runs review processing in the background. |
+| `setup_webhook.py` | Registers a signed pull-request webhook for a public server or tunnel URL. |
+| `tests/` | Unit and API tests for configuration, comments, and webhook security. |
+| `.github/workflows/ci.yml` | Runs syntax checks and pytest on pushes and pull requests. |
 | `review_single_pr.py` | Generates a review, prints it, and asks for confirmation before posting. |
 | `auto_review.py` | Reviews PR number `1` and posts immediately; intended as a simple automation example. |
 | `create_test_pr.py` | Creates a deliberately vulnerable test PR for demonstrating review behavior. |
@@ -202,17 +219,40 @@ Edit `.env`:
 
 ```dotenv
 GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.3-70b-versatile
 GITHUB_TOKEN=your_github_token
 GITHUB_REPO=owner/repository
+GITHUB_WEBHOOK_SECRET=replace_with_a_long_random_secret
+MAX_DIFF_CHARS=30000
+MAX_CONTEXT_CHARS=8000
 ```
 
 | Variable | Required | Description |
 |---|---:|---|
 | `GROQ_API_KEY` | Yes | Authenticates requests to the Groq-hosted review model. |
+| `GROQ_MODEL` | No | Groq model name. Defaults to `llama-3.3-70b-versatile`. |
 | `GITHUB_TOKEN` | Yes | Authenticates repository, PR, comment, indexing, webhook, and optional test-PR operations. |
 | `GITHUB_REPO` | Yes | Repository in `owner/repository` format. |
+| `GITHUB_WEBHOOK_SECRET` | Yes for webhooks | Shared secret used to sign and verify webhook payloads. |
+| `MAX_DIFF_CHARS` | No | Maximum PR diff characters sent to the model. Defaults to `30000`. |
+| `MAX_CONTEXT_CHARS` | No | Maximum retrieved context characters sent to the model. Defaults to `8000`. |
 
 `.env`, `venv/`, `__pycache__/`, and `codebase_index/` are excluded from Git.
+
+Generate a webhook secret with a password manager or a cryptographically secure
+random generator. The same value is registered by `setup_webhook.py` and read
+by the FastAPI server.
+
+## Automated tests and CI
+
+Run the local test suite:
+
+```bash
+pytest -q
+```
+
+GitHub Actions runs the tests and a full Python syntax check on every pull
+request and every push to `main`.
 
 ## Indexing the repository
 
@@ -300,12 +340,13 @@ The script registers:
 https://your-public-url.example/webhook
 ```
 
-for GitHub `pull_request` events.
+for GitHub `pull_request` events and configures the secret from
+`GITHUB_WEBHOOK_SECRET`.
 
 ### 4. Open a pull request
 
-When a PR is opened, GitHub sends the event, the server returns an immediate
-success response, and the review runs as a background task.
+Opening, reopening, marking ready, or pushing commits to a non-draft PR
+triggers a review. Later runs update the existing agent comment.
 
 ## Testing the automation
 
@@ -365,9 +406,6 @@ as GitHub's formal approve/request-changes review event.
 
 ## Limitations
 
-- Webhook authenticity is not currently verified with a webhook secret.
-- Only the `opened` pull-request action triggers an automatic review.
-- Synchronize/reopen events do not trigger another review.
 - The background task runs inside the web process and is not a durable queue.
 - The code index stores only the first 2,000 characters of each source file.
 - Only the listed programming-language extensions are indexed.
@@ -376,8 +414,8 @@ as GitHub's formal approve/request-changes review event.
 - Generated feedback may contain false positives or miss real defects.
 - Reviews are comments rather than line-level annotations.
 
-For production use, add webhook signature validation, idempotency, durable job
-processing, retry handling, logging, observability, and repository-specific
+For a larger production deployment, add a durable job queue, retry policy,
+delivery-level idempotency, structured observability, and repository-specific
 review policies.
 
 ## Troubleshooting
@@ -412,7 +450,8 @@ Private repositories require explicit token access.
 - Check the repository's webhook delivery history in GitHub settings.
 - Ensure the URL ends with `/webhook`.
 - Confirm the content type is `application/json`.
-- Verify the event is a newly opened pull request.
+- Confirm `GITHUB_WEBHOOK_SECRET` matches the secret registered in GitHub.
+- Verify the event is a supported pull-request action.
 
 ### Review is generated but not posted
 
@@ -431,8 +470,7 @@ running the helper again.
 - Never commit `.env`.
 - Revoke any credential immediately if it appears in source control, logs,
   screenshots, chat, or terminal history.
-- Add a GitHub webhook secret and verify `X-Hub-Signature-256` before trusting
-  webhook payloads in a production deployment.
+- Rotate `GITHUB_WEBHOOK_SECRET` if it is exposed.
 - Treat pull-request text and code as untrusted prompt input.
 - Restrict token permissions and repository access to the minimum required.
 - Review AI-generated feedback before acting on security-critical findings.

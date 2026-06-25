@@ -1,59 +1,75 @@
+"""Repository indexing and semantic context retrieval."""
+
 import os
+
 import chromadb
-from github import Github
-from dotenv import load_dotenv
 
-load_dotenv()
+from github_client import get_repository
 
-# ChromaDB stores your codebase as searchable vectors
-chroma_client = chromadb.PersistentClient(path="./codebase_index")
-collection = chroma_client.get_or_create_collection("codebase")
+COLLECTION_NAME = "codebase"
+INDEX_PATH = "./codebase_index"
+SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".java", ".go", ".rb", ".php", ".cs"}
 
-SUPPORTED_EXTENSIONS = [".py", ".js", ".ts", ".java", ".go", ".rb", ".php", ".cs"]
 
-def index_repository():
-    """Download and index all code files from the GitHub repo."""
-    token = os.getenv("GITHUB_TOKEN")
-    repo_name = os.getenv("GITHUB_REPO")
+def get_collection(recreate: bool = False):
+    """Open the ChromaDB collection lazily to avoid import-time side effects."""
+    client = chromadb.PersistentClient(path=INDEX_PATH)
+    if recreate:
+        try:
+            client.delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
+    return client.get_or_create_collection(COLLECTION_NAME)
 
-    client = Github(token)
-    repo = client.get_repo(repo_name)
 
-    print(f"Indexing repository: {repo_name}")
-    contents = repo.get_contents("")
+def index_repository(recreate: bool = True) -> int:
+    """Download and index supported source files from the configured repo."""
+    repo = get_repository()
+    collection = get_collection(recreate=recreate)
+
+    print(f"Indexing repository: {repo.full_name}")
+    contents = list(repo.get_contents(""))
     files_indexed = 0
 
     while contents:
-        file = contents.pop(0)
-        if file.type == "dir":
-            contents.extend(repo.get_contents(file.path))
-        else:
-            ext = os.path.splitext(file.name)[1]
-            if ext in SUPPORTED_EXTENSIONS:
-                try:
-                    code = file.decoded_content.decode("utf-8")
-                    # Store in ChromaDB
-                    collection.upsert(
-                        documents=[code[:2000]],  # limit size per file
-                        ids=[file.path],
-                        metadatas=[{"path": file.path}]
-                    )
-                    files_indexed += 1
-                    print(f"  Indexed: {file.path}")
-                except Exception as e:
-                    print(f"  Skipped {file.path}: {e}")
+        item = contents.pop(0)
+        if item.type == "dir":
+            contents.extend(repo.get_contents(item.path))
+            continue
+
+        if os.path.splitext(item.name)[1].lower() not in SUPPORTED_EXTENSIONS:
+            continue
+
+        try:
+            code = item.decoded_content.decode("utf-8")
+            collection.upsert(
+                documents=[code[:2000]],
+                ids=[item.path],
+                metadatas=[{"path": item.path}],
+            )
+            files_indexed += 1
+            print(f"  Indexed: {item.path}")
+        except Exception as exc:
+            print(f"  Skipped {item.path}: {exc}")
 
     print(f"\nDone! Indexed {files_indexed} files.")
+    return files_indexed
+
 
 def search_codebase(query: str, top_k: int = 3) -> str:
-    """Search the indexed codebase for relevant code snippets."""
-    results = collection.query(query_texts=[query], n_results=top_k)
-
-    if not results["documents"][0]:
+    """Search the indexed codebase and render the best matching snippets."""
+    collection = get_collection()
+    count = collection.count()
+    if count == 0:
         return ""
 
-    context = "Relevant code from the codebase:\n"
-    for i, (doc, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0])):
-        context += f"\n--- {meta['path']} ---\n{doc}\n"
+    results = collection.query(query_texts=[query], n_results=min(top_k, count))
+    documents = results.get("documents") or [[]]
+    metadata = results.get("metadatas") or [[]]
+    if not documents[0]:
+        return ""
 
-    return context
+    sections = ["Relevant code from the codebase:"]
+    for document, item_metadata in zip(documents[0], metadata[0]):
+        sections.append(f"\n--- {item_metadata['path']} ---\n{document}")
+    return "\n".join(sections)
