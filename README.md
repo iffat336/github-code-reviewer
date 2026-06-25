@@ -182,11 +182,7 @@ Install dependencies:
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-pip install groq
 ```
-
-`reviewer_agent.py` uses the `groq` Python package. Install it explicitly as
-shown above if the current `requirements.txt` does not yet provide it.
 
 Create `.env`:
 
